@@ -52,12 +52,17 @@ async function startChainListener() {
 
 // --- 核心模块：提供给前端的接口 ---
 app.get("/history", async (req, res) => {
-    try {
-        const data = await Stake.findAll({ order: [['createdAt', 'DESC']] });
-        res.json(data);
-    } catch (err) {
-        res.status(500).json({ error: "无法读取数据库" });
+    const { address } = req.query; // 获取前端传来的地址参数
+    let filter = {};
+    if (address) {
+        filter = { userAddress: address.toLowerCase() };
     }
+    // 查找该用户的所有记录
+    const data = await Stake.findAll({ 
+        where: filter,
+        order: [['createdAt', 'DESC']] 
+    });
+    res.json(data);
 });
 
 // --- 启动程序 ---

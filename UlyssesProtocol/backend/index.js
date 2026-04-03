@@ -1,114 +1,159 @@
-const { ethers } = require("ethers");
+const { ethers, getAddress } = require("ethers");
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 require("dotenv").config();
 const { sequelize, Stake } = require("./db");
+const { Op } = require("sequelize");
 
 const app = express();
 app.use(cors());
 const PORT = 3001;
 
-// --- 核心模块：区块链监听警察 ---
-async function startChainListener() {
+// --- 全局变量：记录上次扫描到的区块高度 ---
+let lastScannedBlock = 0;
+
+// --- 核心模块 I：自动化执行罚没 (Slash) ---
+async function executeSlash(stakeRecord) {
     try {
-        // 1. 环境检查
-        const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+        const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, 43113);
+        const watcherWallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
         const abi = JSON.parse(fs.readFileSync("./abi.json", "utf8"));
-        const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, provider);
+        const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, watcherWallet);
 
-        console.log("-----------------------------------------");
-        console.log("🚨 链下警察已穿好制服，正在巡逻 Fuji 测试网...");
-        console.log(`📍 监控合约: ${process.env.CONTRACT_ADDRESS}`);
+        console.log(`🔨 [执法中] 正在对违约用户 ${stakeRecord.userAddress} 发起罚没...`);
+        
+        // 调用合约的 slash 方法
+        const tx = await contract.slash(stakeRecord.userAddress, stakeRecord.targetAddress);
+        console.log(`⏳ 交易已提交，哈希: ${tx.hash}`);
+        
+        await tx.wait(); // 等待链上确认
+        
+        // 更新数据库状态：2 代表已处理/已罚没
+        await stakeRecord.update({ status: 2 });
+        console.log(`✅ [执法成功] 用户 ${stakeRecord.userAddress} 的质押已被罚没。`);
+        
+    } catch (error) {
+        console.error(`❌ [执法失败] 用户 ${stakeRecord.userAddress}:`, error.reason || error.message);
+        // 如果合约提示已经罚过了，也更新数据库状态避免死循环
+        if (error.message.toLowerCase().includes("already slashed")) {
+            await stakeRecord.update({ status: 2 });
+        }
+    }
+}
 
-        // 2. 监听真实的 Staked 事件 (根据你给的正式 ABI)
-        // 参数顺序：user, target, amount, weight, startTime, unlockTime
-        contract.on("Staked", async (user, target, amount, weight, startTime, unlockTime) => {
-            console.log(`\n🔔 发现新质押！`);
-            console.log(`👤 用户: ${user}`);
-            console.log(`🎯 目标: ${target}`);
-            console.log(`💰 金额: ${ethers.formatEther(amount)} tokens`);
-            console.log(`⏳ 解锁时间戳: ${unlockTime}`);
+// --- 核心模块 II：区块链轮询警察 (代替 contract.on) ---
+async function pollChainEvents() {
+    try {
+        const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, 43113);
+        const abi = JSON.parse(fs.readFileSync("./abi.json", "utf8"));
+        const contractAddress = getAddress(process.env.CONTRACT_ADDRESS.split('=').pop().trim());
+        const contract = new ethers.Contract(contractAddress, abi, provider);
 
-            try {
-                // 3. 自动同步到数据库 (核心模块 I)
-                await Stake.create({
-                    userAddress: user,
-                    targetAddress: target,
+        // 初始化起始区块
+        if (lastScannedBlock === 0) {
+            lastScannedBlock = await provider.getBlockNumber();
+        }
+
+        const currentBlock = await provider.getBlockNumber();
+        if (currentBlock <= lastScannedBlock) return;
+
+        console.log(`🔍 正在扫描区块: ${lastScannedBlock + 1} -> ${currentBlock}`);
+
+        // 抓取 Staked 事件日志
+        const events = await contract.queryFilter("Staked", lastScannedBlock + 1, currentBlock);
+        
+        for (let event of events) {
+            const [user, target, amount, weight, startTime, unlockTime] = event.args;
+            console.log(`\n🔔 发现新质押！用户: ${user}`);
+
+            // 写入数据库 (防重复)
+            await Stake.findOrCreate({
+                where: { 
+                    userAddress: user.toLowerCase(), 
+                    unlockTime: Number(unlockTime) 
+                },
+                defaults: {
+                    userAddress: user.toLowerCase(),
+                    targetAddress: target.toLowerCase(),
                     amount: ethers.formatEther(amount),
                     unlockTime: Number(unlockTime),
                     status: 0
-                });
-                console.log("💾 记录已成功写入数据库。");
-            } catch (dbErr) {
-                console.error("❌ 数据库写入失败:", dbErr);
-            }
-        });
+                }
+            });
+            console.log("💾 记录已同步至数据库。");
+        }
+
+        lastScannedBlock = currentBlock;
 
     } catch (error) {
-        console.error("❌ 启动警察脚本失败，请检查 .env 或 abi.json:", error);
+        console.error("⚠️ 链上扫描出错 (节点繁忙):", error.message);
     }
 }
 
-// --- 核心模块：提供给前端的接口 ---
+// --- 核心模块 III：提供给前端的 API ---
 app.get("/history", async (req, res) => {
-    const { address } = req.query; // 获取前端传来的地址参数
-    let filter = {};
-    if (address) {
-        filter = { userAddress: address.toLowerCase() };
+    try {
+        const { address } = req.query;
+        let filter = {};
+        if (address) {
+            filter = { userAddress: address.toLowerCase() };
+        }
+        const data = await Stake.findAll({ 
+            where: filter,
+            order: [['createdAt', 'DESC']] 
+        });
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ error: "获取历史记录失败" });
     }
-    // 查找该用户的所有记录
-    const data = await Stake.findAll({ 
-        where: filter,
-        order: [['createdAt', 'DESC']] 
-    });
-    res.json(data);
 });
 
-// --- 启动程序 ---
+// --- 周期性任务管理器 ---
+async function startTimers() {
+    // 1. 每 8 秒拉取一次新事件 (避开公共节点限制)
+    setInterval(pollChainEvents, 8000);
+
+    // 2. 每 30 秒检查一次数据库，处理违约
+    setInterval(async () => {
+        const now = Math.floor(Date.now() / 1000);
+        try {
+            const expiredStakes = await Stake.findAll({
+                where: {
+                    status: 0,
+                    unlockTime: { [Op.lt]: now }
+                }
+            });
+
+            for (let stake of expiredStakes) {
+                console.log(`🚨 发现过期记录！用户: ${stake.userAddress}，开始罚没...`);
+                await executeSlash(stake);
+            }
+        } catch (err) {
+            console.error("❌ 定时执法任务出错:", err);
+        }
+    }, 30000);
+}
+
+// --- 程序主入口 ---
 async function main() {
-    // 首先同步数据库结构
-    await sequelize.sync(); 
-    console.log("✅ 数据库结构已就绪");
+    try {
+        // 【关键改动】使用 { force: true } 强制清空并重建所有表结构
+        // 运行成功一次后，建议把 { force: true } 删掉，否则每次启动都会丢数据
+        await sequelize.sync({ force: true }); 
+        console.log("✅ 数据库结构已【强制刷新】就绪");
 
-    // 开启监听
-    startChainListener();
+        await startTimers();
 
-    // 开启 Web 服务
-    app.listen(PORT, () => {
-        console.log(`🌐 前端接口已开通: http://localhost:${PORT}/history`);
-        console.log("-----------------------------------------");
-    });
+        app.listen(PORT, () => {
+            console.log("-----------------------------------------");
+            console.log("🚨 Ulysses 后端警察已上线！");
+            console.log(`🌐 API 地址: http://localhost:${PORT}/history`);
+            console.log("-----------------------------------------");
+        });
+    } catch (err) {
+        console.error("❌ 程序启动失败:", err);
+    }
 }
 
 main();
-
-// 每隔 1 分钟扫描一次数据库
-setInterval(async () => {
-    const now = Math.floor(Date.now() / 1000);
-    // 找出所有 1. 正在监控中(status:0) 且 2. 时间已过解锁时间(unlockTime) 的记录
-    const expiredStakes = await Stake.findAll({
-        where: {
-            status: 0,
-            unlockTime: { [Sequelize.Op.lt]: now } // lt 代表 "小于"
-        }
-    });
-
-    for (let stake of expiredStakes) {
-        console.log(`🚨 发现潜在违约：用户 ${stake.userAddress} 质押已过期！`);
-        // 下一步：执行罚没逻辑
-    }
-}, 60000);
-
-// 执行罚没函数
-async function executeSlash(offender, target) {
-    const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-    const watcherWallet = new ethers.Wallet(process.env.WATCHER_PRIVATE_KEY, provider);
-    const abi = JSON.parse(fs.readFileSync("./abi.json", "utf8"));
-    const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, watcherWallet);
-
-    console.log(`🔨 正在对 ${offender} 发起罚没请求...`);
-    const tx = await contract.slash(offender, target);
-    await tx.wait(); // 等待链上确认
-    console.log(`✅ 罚没成功！交易哈希: ${tx.hash}`);
-}

@@ -64,7 +64,7 @@ The current "Buy-Action" logic is only the starting point for the Ulysses framew
 
 ### 👥 Team & Responsibilities
 
-* **Nina** —— **Product Architect / Contract Engineer**
+* **[Nina]** —— **Product Architect / Contract Engineer**
     * **Core Contributions:** Established the underlying behavioral finance framework of the Ulysses Protocol; designed the "Ulysses Pact" governance logic and the sub-linear willpower weighting model.
     * **Project Delivery:** Responsible for core smart contract development, production of the standardized documentation suite (PRD/README), and end-to-end logic design.
 

@@ -10,72 +10,72 @@ const app = express();
 app.use(cors());
 const PORT = 3001;
 
-// --- 【新增配置】土狗币监控参数 ---
-const SHIT_COIN_ADDRESS = "0x6D4aE566094D4E298b59eF0E243e9aBcE374C2Ba";
+// --- 核心配置：ERC20 余额查询 ABI ---
 const MIN_ERC20_ABI = [
     "function balanceOf(address account) external view returns (uint256)"
 ];
 
-// --- 全局变量与初始化 ---
-let lastScannedBlock = 0;
+// --- 全局初始化 (修复重复声明报错) ---
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 const pk = process.env.WATCHER_PRIVATE_KEY?.trim();
 
 if (!pk) {
-    console.error("❌ 错误: .env 中未设置 WATCHER_PRIVATE_KEY");
+    console.error("❌ 错误: .env 中未检测到 WATCHER_PRIVATE_KEY，请检查路径和文件内容");
     process.exit(1);
 }
-const watcherWallet = new ethers.Wallet(pk, provider);
 
-// --- 核心模块 I：自动化执行罚没 (Slash) ---
+const watcherWallet = new ethers.Wallet(pk, provider);
+let lastScannedBlock = 0;
+
+// --- 核心模块 I：执行链上罚没 ---
 async function executeSlash(stakeRecord) {
     try {
         const abi = JSON.parse(fs.readFileSync("./abi.json", "utf8"));
-        const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, watcherWallet);
+        const contractAddress = getAddress(process.env.CONTRACT_ADDRESS.trim());
+        const contract = new ethers.Contract(contractAddress, abi, watcherWallet);
 
         console.log(`🔨 [执法中] 正在对违约用户 ${stakeRecord.userAddress} 发起罚没...`);
         
-        // 调用合约的 slash 方法
+        // 调用合约 slash 方法 (确保合约里有这个函数)
         const tx = await contract.slash(stakeRecord.userAddress, stakeRecord.targetAddress);
         console.log(`⏳ 交易已提交，哈希: ${tx.hash}`);
         
-        await tx.wait(); // 等待链上确认
+        await tx.wait(); // 等待区块确认
         
-        // 更新数据库状态：2 代表已罚没
+        // 更新数据库状态：2 代表已罚没/已处理
         await stakeRecord.update({ status: 2 });
-        console.log(`✅ [执法成功] 用户 ${stakeRecord.userAddress} 的质押已被罚没。`);
+        console.log(`✅ [执法成功] 用户 ${stakeRecord.userAddress} 的质押已被扣除。`);
         
     } catch (error) {
         console.error(`❌ [执法失败] 用户 ${stakeRecord.userAddress}:`, error.reason || error.message);
+        // 如果链上已经罚过了，同步数据库状态
         if (error.message.toLowerCase().includes("already slashed")) {
             await stakeRecord.update({ status: 2 });
         }
     }
 }
 
-// --- 核心模块 II：区块链轮询警察 ---
+// --- 核心模块 II：区块链事件监听 (同步新质押) ---
 async function pollChainEvents() {
     try {
         const abi = JSON.parse(fs.readFileSync("./abi.json", "utf8"));
-        const currentBlock = await provider.getBlockNumber();
+        const contractAddress = getAddress(process.env.CONTRACT_ADDRESS.trim());
+        const contract = new ethers.Contract(contractAddress, abi, provider);
 
+        const currentBlock = await provider.getBlockNumber();
         if (lastScannedBlock === 0) {
-            lastScannedBlock = currentBlock;
-            return;
+            lastScannedBlock = currentBlock - 100; // 首次启动向前扫描100个区块
         }
 
         if (currentBlock <= lastScannedBlock) return;
 
-        console.log(`🔍 正在扫描区块: ${lastScannedBlock + 1} -> ${currentBlock}`);
-
-        const contractAddress = getAddress(process.env.CONTRACT_ADDRESS.trim());
-        const contract = new ethers.Contract(contractAddress, abi, provider);
+        console.log(`🔍 扫描区块: ${lastScannedBlock + 1} -> ${currentBlock}`);
 
         const events = await contract.queryFilter("Staked", lastScannedBlock + 1, currentBlock);
         
         for (let event of events) {
             const [user, target, amount, weight, startTime, unlockTime] = event.args;
-            console.log(`\n🔔 发现新质押！用户: ${user}`);
+            console.log(`\n🔔 监测到新质押！用户: ${user} | 目标币种: ${target}`);
 
             await Stake.findOrCreate({
                 where: { 
@@ -84,28 +84,25 @@ async function pollChainEvents() {
                 },
                 defaults: {
                     userAddress: user.toLowerCase(),
-                    targetAddress: target.toLowerCase(),
+                    targetAddress: target.toLowerCase(), // 这里存入的就是用户承诺不买的币
                     amount: ethers.formatEther(amount),
                     unlockTime: Number(unlockTime),
                     status: 0
                 }
             });
-            console.log("💾 记录已同步至数据库。");
         }
-
         lastScannedBlock = currentBlock;
-
     } catch (error) {
-        console.error("⚠️ 链上扫描出错:", error.message);
+        console.error("⚠️ 链上扫描异常:", error.message);
     }
 }
 
-// --- 核心模块 III：动态判定巡逻逻辑 (每个用户查自己的禁忌币) ---
+// --- 核心模块 III：自动化监控 (检查时间+余额) ---
 async function startTimers() {
-    // 1. 每 8 秒拉取一次新事件
-    setInterval(pollChainEvents, 8000);
+    // 每 10 秒扫一次新事件
+    setInterval(pollChainEvents, 10000);
 
-    // 2. 每 20 秒检查一次违约情况
+    // 每 20 秒检查一次违规
     setInterval(async () => {
         const now = Math.floor(Date.now() / 1000);
         
@@ -113,39 +110,36 @@ async function startTimers() {
             const activeStakes = await Stake.findAll({ where: { status: 0 } });
 
             for (let stake of activeStakes) {
-                // 【核心改动】：不再使用全局常量，而是用数据库里存的那个 targetAddress
-                const userForbiddenToken = stake.targetAddress; 
+                // 【判定 1】：检查用户是否购买了禁忌币
+                const forbiddenToken = stake.targetAddress;
                 
-                // 只有当这个地址看起来像个合约地址时才检查
-                if (ethers.isAddress(userForbiddenToken)) {
-                    const shitCoinContract = new ethers.Contract(userForbiddenToken, MIN_ERC20_ABI, provider);
-                    
+                if (ethers.isAddress(forbiddenToken)) {
+                    const tokenContract = new ethers.Contract(forbiddenToken, MIN_ERC20_ABI, provider);
                     try {
-                        const balance = await shitCoinContract.balanceOf(stake.userAddress);
+                        const balance = await tokenContract.balanceOf(stake.userAddress);
                         if (balance > 0n) {
-                            console.log(`🚨 破戒抓捕！用户 ${stake.userAddress} 持有了他承诺不买的币: ${userForbiddenToken}`);
+                            console.log(`🚨 破戒！检测到用户 ${stake.userAddress} 持有了禁忌币 ${forbiddenToken}`);
                             await executeSlash(stake);
                             continue; 
                         }
-                    } catch (tokenErr) {
-                        // 如果查余额失败（比如地址填错了），记录一下但不崩溃
-                        console.error(`⚠️ 无法查询代币 ${userForbiddenToken} 的余额:`, tokenErr.message);
+                    } catch (e) {
+                        console.warn(`无法读取地址 ${forbiddenToken} 的余额，请检查该地址是否为合法的ERC20代币。`);
                     }
                 }
 
-                // 【判定逻辑 B】：检查时间是否过期
+                // 【判定 2】：检查质押是否到期
                 if (stake.unlockTime < now) {
-                    console.log(`⏰ 时间到！用户 ${stake.userAddress} 挑战成功（或超时未取）。`);
+                    console.log(`⏰ 时间到！用户 ${stake.userAddress} 锁定结束，执行后续逻辑。`);
                     await executeSlash(stake);
                 }
             }
         } catch (err) {
-            console.error("❌ 定'时巡逻任务出错:", err);
+            console.error("❌ 巡逻任务出错:", err);
         }
     }, 20000);
 }
 
-// --- API 接口 ---
+// --- API 路由 ---
 app.get("/history", async (req, res) => {
     try {
         const { address } = req.query;
@@ -166,16 +160,15 @@ app.get("/history", async (req, res) => {
 // --- 主程序入口 ---
 async function main() {
     try {
-        // 第一次运行请保留 { force: true }，成功后建议改为 await sequelize.sync();
+        // 同步数据库表结构 (首次运行建议保留 force: true)
         await sequelize.sync({ force: true }); 
-        console.log("✅ 数据库结构已【强制刷新】就绪");
+        console.log("✅ 数据库已就绪并强制刷新");
 
         await startTimers();
 
         app.listen(PORT, () => {
             console.log("-----------------------------------------");
             console.log("🚨 Ulysses 后端警察已上线！");
-            console.log(`🛡️ 监控目标: ${SHIT_COIN_ADDRESS}`);
             console.log(`🌐 API 地址: http://localhost:${PORT}/history`);
             console.log("-----------------------------------------");
         });
@@ -183,4 +176,5 @@ async function main() {
         console.error("❌ 程序启动失败:", err);
     }
 }
+
 main();

@@ -27,19 +27,31 @@ contract UlyssesProtocol is ReentrancyGuard, Ownable {
     
     uint256 public accRewardPerWeight;    
     uint256 public totalWeight;           
-    uint256 public constant PRECISION = 1e18; 
+    uint256 public constant PRECISION = 1e12;  // 精度倍数，用于保持计算灵敏
 
     // 使用嵌套映射：用户地址 => 目标代币地址 => 质押信息
     mapping(address => mapping(address => StakeInfo)) public userStakes;
+
+    // --- 白名单 token ---
+    mapping(address => bool) public allowedTargets;
 
     // --- 事件 ---
     event Staked(address indexed user, address indexed target, uint256 amount, uint256 weight, uint256 startTime, uint256 unlockTime);
     event Slashed(address indexed offender, address indexed target, uint256 amount, uint256 accIncrease, uint256 endTime);
     event Claimed(address indexed user, address indexed target, uint256 principal, uint256 reward, uint256 endTime);
+    event AllowedTargetUpdated(address indexed token, bool allowed);
 
     constructor(address _stakingToken, address _watcher) Ownable(msg.sender) {
         stakingToken = IERC20(_stakingToken);
         watcher = _watcher;
+    }
+
+    /**
+     * @notice 管理白名单 token
+     */
+    function setAllowedTarget(address token, bool allowed) external onlyOwner {
+        allowedTargets[token] = allowed;
+        emit AllowedTargetUpdated(token, allowed);
     }
 
     /**
@@ -66,11 +78,22 @@ contract UlyssesProtocol is ReentrancyGuard, Ownable {
      */
     function stake(uint256 _amount, uint256 _duration, address _target) external nonReentrant {
         require(_amount > 0, "Amount zero");
+        require(_duration >= 1 hours, "Duration too short"); // 增加 duration 下限检查，防止用户设置 1 秒钟来刷分红。至少锁定比如说1小时才有博弈意义，增加攻击成本和对抗信息不对称。
         require(_target != address(0), "Target cannot be zero address");
         require(_target != address(stakingToken), "Target cannot be the staking token");
         require(!userStakes[msg.sender][_target].isActive, "Target already under challenge");
 
-        stakingToken.transferFrom(msg.sender, address(this), _amount);
+        // --- 白名单或 ERC20 验证，防止垃圾地址或非 ERC20 合约被 stake（一般防御性编码） ---
+        if (!allowedTargets[_target]) {
+            // 白名单外 token，需要验证 ERC20 totalSupply()
+            try IERC20(_target).totalSupply() returns (uint256 supply) {
+                require(supply > 0, "Target not ERC20");
+            } catch {
+                revert("Target not ERC20");
+            }
+        }
+
+        stakingToken.transferFrom(msg.sender, address(this), _amount); // // 【安全】先转账，后记录状态 (Checks-Effects-Interactions)
 
         // 数学模型还原：W = sqrt(P * PRECISION) * min(T, 3 days)
         // 引入 PRECISION 放大 P，防止 sqrt 后的数值过小导致精度丢失
@@ -106,6 +129,7 @@ contract UlyssesProtocol is ReentrancyGuard, Ownable {
         uint256 weight = info.weight;
 
         // 更新全局收益系数 Acc
+        require(totalWeight > 0, "Total weight zero"); // （一般防御性编程）
         uint256 increase = (slashAmount * PRECISION) / totalWeight;
         accRewardPerWeight += increase;
 

@@ -1,8 +1,26 @@
 const { ethers, getAddress } = require("ethers");
+require("dotenv").config();
+/*const pkRaw = process.env.WATCHER_PRIVATE_KEY;
+console.log("WATCHER_PRIVATE_KEY raw:", pkRaw);
+console.log("exists:", !!pkRaw);
+console.log("length:", pkRaw?.length);*/
+
+
+
+/**console.log("WATCHER_PRIVATE_KEY exists:", !!process.env.WATCHER_PRIVATE_KEY);
+        //const pk = process.env.WATCHER_PRIVATE_KEY?.trim();
+        console.log("WATCHER_PRIVATE_KEY length:", pk ? pk.length : "undefined");
+        if (pk) {
+            const watcherWallet = new ethers.Wallet(pk);
+            console.log("watcher钱包地址:", watcherWallet.address);
+        }*/
+
+
+
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
-require("dotenv").config();
+
 const { sequelize, Stake } = require("./db");
 const { Op } = require("sequelize");
 
@@ -13,11 +31,19 @@ const PORT = 3001;
 // --- 全局变量：记录上次扫描到的区块高度 ---
 let lastScannedBlock = 0;
 
+const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+const pk = process.env.WATCHER_PRIVATE_KEY?.trim();
+const watcherWallet = new ethers.Wallet(pk, provider); // <- 全局
+
+
 // --- 核心模块 I：自动化执行罚没 (Slash) ---
 async function executeSlash(stakeRecord) {
     try {
         const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, 43113);
-        const watcherWallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+        //const pk = process.env.WATCHER_PRIVATE_KEY?.trim();
+        //let pk = process.env.WATCHER_PRIVATE_KEY?.trim();
+        //pk = pk.replace(/\r?\n|\r/g, "");
+        //const watcherWallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
         const abi = JSON.parse(fs.readFileSync("./abi.json", "utf8"));
         const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, watcherWallet);
 
@@ -47,7 +73,12 @@ async function pollChainEvents() {
     try {
         const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, 43113);
         const abi = JSON.parse(fs.readFileSync("./abi.json", "utf8"));
-        const contractAddress = getAddress(process.env.CONTRACT_ADDRESS.split('=').pop().trim());
+        const latestBlock = await provider.getBlockNumber();
+        console.log("⛓ 当前链最新区块号:", latestBlock);
+        if (!process.env.CONTRACT_ADDRESS) {
+  throw new Error("CONTRACT_ADDRESS 没有在 .env 里设置");
+}
+        const contractAddress = getAddress(process.env.CONTRACT_ADDRESS.trim());
         const contract = new ethers.Contract(contractAddress, abi, provider);
 
         // 初始化起始区块
@@ -155,5 +186,9 @@ async function main() {
         console.error("❌ 程序启动失败:", err);
     }
 }
+
+console.log("WATCHER_PRIVATE_KEY raw:", process.env.WATCHER_PRIVATE_KEY);
+
+
 
 main();

@@ -1,4 +1,4 @@
----
+# README
 
 # ⚓ Ulysses Protocol (尤利西斯协议)
 
@@ -76,3 +76,7 @@ git clone https://github.com/ninaliu9671/WWW6.5-Hackathon/UlyssesProtocol.git
 forge install
 # 运行测试
 forge test`
+
+[PRD_EN](https://www.notion.so/PRD_EN-338e13518ac780b9afa6c77d7f2ab64c?pvs=21)
+
+[产品需求文档 (PRD)：Ulysses Protocol —— 链上理智锚定协议](https://www.notion.so/PRD-Ulysses-Protocol-338e13518ac780108ff9c27fa6995d3c?pvs=21)
